@@ -10,10 +10,9 @@ rejeite uma alteração financeira de forma consistente, sem depender de uma
 entrega SQS para confirmar o saldo.
 
 Esse recorte reduz riscos de lost updates e efeitos duplicados, e torna o
-resultado verificável pela reconciliação do ledger. O publisher da outbox e o
-consumidor SQS com Inbox persistente agora estão implementados. O worker que
-retoma transações `PENDING_REFERENCE` quando a referência chega posteriormente
-continua pendente.
+resultado verificável pela reconciliação do ledger. O publisher da outbox, o
+consumidor SQS com Inbox persistente e o worker de `PENDING_REFERENCE` estão
+implementados como mecanismos separados do commit financeiro síncrono.
 
 ## Camadas e responsabilidades
 
@@ -81,9 +80,28 @@ efeito financeiro.
 persistida com `PENDING_REFERENCE`, e um evento correspondente é gravado na
 outbox. A validação de referência existente verifica status, jogador, carteira,
 rodada, moeda, valor e tipo permitido; uma referência inválida é rejeitada.
-Ainda não há worker para localizar a referência que chegar depois e retomar a
-operação. Portanto, o registro pendente é persistido, mas não é
-automaticamente reprocessado nesta entrega.
+`PendingReferenceWorker` consulta até dez pendências elegíveis por ciclo usando
+`PESSIMISTIC_PARTIAL_WRITE` (`SKIP LOCKED`), e processa cada uma em uma
+transação curta. Ao encontrar a referência processada, ele adquire o lock da
+wallet e grava a transição, eventual saldo, ledger e eventos Outbox no mesmo
+commit. O worker repete a consulta a cada segundo; falhas da execução são
+registradas sem derrubar a aplicação.
+
+Referências ainda ausentes recebem backoff exponencial de 1, 2, 4 e 8 segundos.
+Na quinta tentativa sem referência, a operação termina como `REJECTED` com
+`MISSING_REFERENCE` e evento de rejeição na Outbox. Um índice parcial acelera a
+busca das pendências, e os campos de tentativa ficam persistidos para que
+reinícios e múltiplas instâncias não percam o progresso. A primeira resposta
+continua sendo `202 PENDING_REFERENCE`; um replay posterior reflete o estado
+persistido atualizado e o saldo final daquela operação.
+
+Uma transação `PROCESSED` só pode ser revertida uma vez. Isso impede que um
+`REFUND` e um `ROLLBACK` independentes creditem duas vezes o mesmo `BET`.
+Reverter um `REFUND` continua permitido: nesse caso, o `ROLLBACK` referencia o
+identificador externo do próprio `REFUND` e desfaz seu crédito. Reversões
+`REJECTED` e `PENDING_REFERENCE` não reservam a referência; apenas reversões
+processadas participam da consulta e do índice único parcial do PostgreSQL.
+Essa regra é aplicada sob o lock da carteira e protegida também por constraint.
 
 ## Dados e restrições PostgreSQL
 
@@ -97,7 +115,7 @@ incluindo:
 - referência estrangeira de transações/lançamentos para carteira e transação;
 - consistência entre direção, saldo anterior, quantia e saldo posterior do
   ledger;
-- no máximo uma reversão do mesmo tipo para a transação de referência.
+- no máximo uma reversão processada por transação de referência.
 
 As constraints do banco são uma última barreira de integridade, não substituem
 validações nos DTOs ou invariantes do domínio. Escritas e filtros usam APIs
@@ -148,12 +166,13 @@ e redrive para `wagers-dlq` após cinco entregas. O `/health/ready` faz consulta
 real ao PostgreSQL e ao atributo da fila SQS; readiness indica dependências
 acessíveis, não ausência de backlog ou processamento sem falhas.
 
-### Ainda pendente
+### Limitações ainda existentes
 
-O worker que reprocessa operações `PENDING_REFERENCE` quando uma referência
-chega depois continua pendente. Também são necessários alertas operacionais
-para DLQ/backlog e testes de falhas distribuídas em múltiplas instâncias antes
-de produção.
+O consumidor SQS atual persiste notificações de integração na Inbox; ele não é
+o consumidor de comandos `WagerTransactionRequested` descrito no contrato do
+desafio nem reaplica efeitos financeiros. Também são necessários alertas
+operacionais para DLQ/backlog e testes de falhas distribuídas em múltiplas
+instâncias antes de produção.
 
 ## Segurança HTTP e autenticação
 
@@ -178,13 +197,15 @@ operar o sistema; atualmente isso não é implementado nesta fatia.
 
 ## Testes e comandos
 
-Os testes cobrem value objects e invariantes do domínio, além de integração
+Os testes Bun cobrem value objects e invariantes do domínio, além de integração
 HTTP com PostgreSQL e LocalStack reais: concorrência de débitos sobre uma
-carteira, replay idempotente, conflito de payload, reconciliação, health
-público, autenticação, rejeição de propriedades extras e propagação outbox →
-SQS → Inbox. O teste concorrente usa duas apostas de R$ 80,00 sobre saldo de
-R$ 100,00; deve resultar em apenas um débito aceito e saldo final
-reconciliável.
+carteira, replay idempotente, conflito de payload, reconciliação, reversão de
+refund, prevenção de crédito duplicado, retry após reversão rejeitada,
+reprocessamento de `ROLLBACK` fora de ordem, backoff e rejeição após cinco
+tentativas, dois ciclos de worker concorrentes, health público, autenticação,
+rejeição de propriedades extras e propagação outbox → SQS → Inbox. O teste
+concorrente de saldo usa duas apostas de R$ 80,00 sobre saldo de R$ 100,00; deve
+resultar em apenas um débito aceito e saldo final reconciliável.
 
 Ainda devem ser ampliados os cenários de carga/concorrência distribuída, SQS e
 falhas/retries. Com PostgreSQL e LocalStack disponíveis:

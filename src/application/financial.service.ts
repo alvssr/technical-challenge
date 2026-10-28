@@ -36,6 +36,10 @@ import { Inject } from '@nestjs/common';
 
 @Injectable()
 export class FinancialService {
+  private static readonly MAX_REFERENCE_ATTEMPTS = 5;
+  private static readonly REFERENCE_RETRY_BASE_MS = 1_000;
+  private static readonly REFERENCE_RETRY_MAX_MS = 60_000;
+
   constructor(@Inject(DATABASE_ORM) private readonly orm: MikroORM) {}
 
   async openWallet(dto: CreateWalletDto): Promise<Record<string, unknown>> {
@@ -198,24 +202,22 @@ export class FinancialService {
           gameId: dto.gameId,
           kind: dto.kind,
           money,
-          referenceExternalTransactionId:
-            dto.referenceExternalTransactionId,
+          referenceExternalTransactionId: dto.referenceExternalTransactionId,
         });
 
         const rejection = this.getWalletRejection(dto, money, wallet);
         if (rejection) {
-          return this.rejectTransaction(
-            em,
-            transaction,
-            wallet,
-            rejection,
-          );
+          return this.rejectTransaction(em, transaction, wallet, rejection);
         }
 
         let reference: WagerTransactionPersistenceState | null = null;
         if (transaction.requiresReference()) {
           reference = await this.findReference(em, transaction);
-          if (!reference) {
+          if (
+            !reference ||
+            reference.status === WagerTransactionStatus.Pending ||
+            reference.status === WagerTransactionStatus.PendingReference
+          ) {
             transaction.markPendingReference();
             await this.insertTransaction(
               em,
@@ -257,35 +259,9 @@ export class FinancialService {
           }
         }
 
-        if (
-          reference &&
-          (transaction.kind === WagerTransactionKind.Refund ||
-            transaction.kind === WagerTransactionKind.Rollback)
-        ) {
-          const duplicateReversal = await em.findOne<WagerTransactionPersistenceState>(
-            WagerTransactionSchema,
-            {
-              providerId: transaction.providerId,
-              referenceExternalTransactionId:
-                transaction.referenceExternalTransactionId,
-              kind: transaction.kind,
-            },
-          );
-          if (duplicateReversal) {
-            return this.rejectTransaction(
-              em,
-              transaction,
-              wallet,
-              FailureCode.DuplicateTransaction,
-            );
-          }
-        }
-
         const balanceBefore = wallet.balance;
         const direction = transaction.ledgerDirectionFor(
-          reference
-            ? transactionFromPersistence(reference)
-            : undefined,
+          reference ? transactionFromPersistence(reference) : undefined,
         );
 
         try {
@@ -346,17 +322,12 @@ export class FinancialService {
           });
         }
 
-        await this.enqueueOutbox(
-          em,
-          'WagerTransactionProcessed',
-          wallet.id,
-          {
-            transactionId: transaction.id,
-            walletId: wallet.id,
-            kind: transaction.kind,
-            status: transaction.status,
-          },
-        );
+        await this.enqueueOutbox(em, 'WagerTransactionProcessed', wallet.id, {
+          transactionId: transaction.id,
+          walletId: wallet.id,
+          kind: transaction.kind,
+          status: transaction.status,
+        });
         return transactionResponse(
           transaction.id,
           transaction.status,
@@ -433,6 +404,192 @@ export class FinancialService {
     };
   }
 
+  async processPendingReferences(batchSize = 10): Promise<number> {
+    let processedCount = 0;
+
+    while (processedCount < batchSize) {
+      const processed = await this.orm.em.fork().transactional(async (em) => {
+        const now = new Date();
+        const pending = await em.findOne<WagerTransactionPersistenceState>(
+          WagerTransactionSchema,
+          {
+            status: WagerTransactionStatus.PendingReference,
+            $or: [
+              { referenceNextAttemptAt: null },
+              { referenceNextAttemptAt: { $lte: now } },
+            ],
+          },
+          {
+            orderBy: { createdAt: 'ASC' },
+            lockMode: LockMode.PESSIMISTIC_PARTIAL_WRITE,
+          },
+        );
+        if (!pending) return false;
+
+        const walletState = await em.findOne<WalletPersistenceState>(
+          WalletSchema,
+          { id: pending.walletId },
+          { lockMode: LockMode.PESSIMISTIC_WRITE },
+        );
+        if (!walletState) {
+          throw new Error(
+            `Carteira ${pending.walletId} não encontrada para transação pendente ${pending.id}.`,
+          );
+        }
+
+        const wallet = Wallet.rehydrate({
+          id: walletState.id,
+          playerId: walletState.playerId,
+          balance: Money.from({
+            amount: walletState.balance,
+            currency: walletState.currency,
+          }),
+          version: walletState.version,
+          createdAt: walletState.createdAt,
+          updatedAt: walletState.updatedAt,
+        });
+        const transaction = transactionFromPersistence(pending);
+        const reference = await this.findReference(em, transaction);
+        const nextAttempt = pending.referenceAttempts + 1;
+
+        if (
+          !reference ||
+          reference.status === WagerTransactionStatus.Pending ||
+          reference.status === WagerTransactionStatus.PendingReference
+        ) {
+          if (nextAttempt >= FinancialService.MAX_REFERENCE_ATTEMPTS) {
+            transaction.reject(FailureCode.MissingReference);
+            await this.persistPendingResolution(
+              em,
+              pending.id,
+              transaction,
+              wallet.balance,
+              nextAttempt,
+            );
+            await this.enqueueRejectedEvent(em, transaction, wallet.id);
+          } else {
+            const delay = Math.min(
+              FinancialService.REFERENCE_RETRY_BASE_MS * 2 ** (nextAttempt - 1),
+              FinancialService.REFERENCE_RETRY_MAX_MS,
+            );
+            await em.nativeUpdate(
+              WagerTransactionSchema,
+              {
+                id: pending.id,
+                status: WagerTransactionStatus.PendingReference,
+              },
+              {
+                referenceAttempts: nextAttempt,
+                referenceNextAttemptAt: new Date(now.getTime() + delay),
+              },
+            );
+          }
+          return true;
+        }
+
+        const invalidReferenceCode = await this.validateReference(
+          em,
+          transaction,
+          reference,
+        );
+        if (invalidReferenceCode) {
+          transaction.reject(invalidReferenceCode);
+          await this.persistPendingResolution(
+            em,
+            pending.id,
+            transaction,
+            wallet.balance,
+            nextAttempt,
+          );
+          await this.enqueueRejectedEvent(em, transaction, wallet.id);
+          return true;
+        }
+
+        const balanceBefore = wallet.balance;
+        const direction = transaction.ledgerDirectionFor(
+          transactionFromPersistence(reference),
+        );
+
+        try {
+          if (direction === LedgerDirection.Debit) {
+            wallet.debit(transaction.money, now);
+          } else if (direction === LedgerDirection.Credit) {
+            wallet.credit(transaction.money, now);
+          }
+        } catch (error: unknown) {
+          if (!(error instanceof InsufficientBalanceError)) throw error;
+
+          transaction.reject(FailureCode.ReversalWouldCauseNegativeBalance);
+          await this.persistPendingResolution(
+            em,
+            pending.id,
+            transaction,
+            wallet.balance,
+            nextAttempt,
+          );
+          await this.enqueueRejectedEvent(em, transaction, wallet.id);
+          return true;
+        }
+
+        transaction.markProcessed(reference.id, now);
+        if (!balanceBefore.equals(wallet.balance)) {
+          await em.nativeUpdate(
+            WalletSchema,
+            { id: wallet.id },
+            {
+              balance: wallet.balance.toString(),
+              version: wallet.version,
+              updatedAt: wallet.updatedAt,
+            },
+          );
+        }
+
+        await this.persistPendingResolution(
+          em,
+          pending.id,
+          transaction,
+          wallet.balance,
+          nextAttempt,
+        );
+
+        if (direction && !balanceBefore.equals(wallet.balance)) {
+          const entry = WalletLedgerEntry.create({
+            id: randomUUID(),
+            walletId: wallet.id,
+            transactionId: transaction.id,
+            direction,
+            amount: transaction.money,
+            balanceBefore,
+            balanceAfter: wallet.balance,
+          });
+          await this.insertLedgerEntry(em, entry);
+          await this.enqueueOutbox(em, 'WalletBalanceChanged', wallet.id, {
+            transactionId: transaction.id,
+            walletId: wallet.id,
+            direction,
+            money: transaction.money.toJSON(),
+            balanceBefore: balanceBefore.toJSON(),
+            balanceAfter: wallet.balance.toJSON(),
+            walletVersion: wallet.version,
+          });
+        }
+
+        await this.enqueueOutbox(em, 'WagerTransactionProcessed', wallet.id, {
+          transactionId: transaction.id,
+          walletId: wallet.id,
+          kind: transaction.kind,
+          status: transaction.status,
+        });
+        return true;
+      });
+
+      if (!processed) break;
+      processedCount += 1;
+    }
+
+    return processedCount;
+  }
+
   private getWalletRejection(
     dto: CreateWagerTransactionDto,
     money: Money,
@@ -501,7 +658,10 @@ export class FinancialService {
       {
         providerId: transaction.providerId,
         referenceExternalTransactionId: reference.externalTransactionId,
-        kind: transaction.kind,
+        kind: {
+          $in: [WagerTransactionKind.Refund, WagerTransactionKind.Rollback],
+        },
+        status: WagerTransactionStatus.Processed,
       },
     );
     return priorReversal ? FailureCode.DuplicateTransaction : undefined;
@@ -514,11 +674,7 @@ export class FinancialService {
     failureCode: FailureCode,
   ): Promise<FinancialTransactionResponse> {
     transaction.reject(failureCode);
-    await this.insertTransaction(
-      em,
-      transaction,
-      wallet.balance.toString(),
-    );
+    await this.insertTransaction(em, transaction, wallet.balance.toString());
     await this.enqueueOutbox(em, 'WagerTransactionRejected', wallet.id, {
       transactionId: transaction.id,
       walletId: wallet.id,
@@ -533,6 +689,43 @@ export class FinancialService {
       ),
       failureCode,
     };
+  }
+
+  private async persistPendingResolution(
+    em: EntityManager,
+    transactionId: string,
+    transaction: WagerTransaction,
+    responseBalance: Money,
+    attempts: number,
+  ): Promise<void> {
+    await em.nativeUpdate(
+      WagerTransactionSchema,
+      {
+        id: transactionId,
+        status: WagerTransactionStatus.PendingReference,
+      },
+      {
+        status: transaction.status,
+        referenceTransactionId: transaction.referenceTransactionId ?? null,
+        failureCode: transaction.failureCode ?? null,
+        processedAt: transaction.processedAt ?? null,
+        responseBalance: responseBalance.toString(),
+        referenceAttempts: attempts,
+        referenceNextAttemptAt: null,
+      },
+    );
+  }
+
+  private async enqueueRejectedEvent(
+    em: EntityManager,
+    transaction: WagerTransaction,
+    walletId: string,
+  ): Promise<void> {
+    await this.enqueueOutbox(em, 'WagerTransactionRejected', walletId, {
+      transactionId: transaction.id,
+      walletId,
+      failureCode: transaction.failureCode,
+    });
   }
 
   private async findByIdempotencyKey(
@@ -571,6 +764,8 @@ export class FinancialService {
       failureCode: transaction.failureCode ?? null,
       processedAt: transaction.processedAt ?? null,
       responseBalance,
+      referenceAttempts: 0,
+      referenceNextAttemptAt: null,
     });
   }
 
@@ -618,9 +813,7 @@ export interface FinancialTransactionResponse {
   failureCode?: FailureCode;
 }
 
-export function transactionHttpStatus(
-  status: WagerTransactionStatus,
-): number {
+export function transactionHttpStatus(status: WagerTransactionStatus): number {
   if (status === WagerTransactionStatus.PendingReference) return 202;
   if (status === WagerTransactionStatus.Rejected) return 422;
   return 200;
@@ -675,7 +868,9 @@ function replayResponse(
       currency: transaction.currency,
     },
     idempotentReplay: true,
-    ...(transaction.failureCode ? { failureCode: transaction.failureCode } : {}),
+    ...(transaction.failureCode
+      ? { failureCode: transaction.failureCode }
+      : {}),
   };
 }
 

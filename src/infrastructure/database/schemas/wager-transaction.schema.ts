@@ -23,6 +23,8 @@ export interface WagerTransactionPersistenceState {
   failureCode: FailureCode | null;
   processedAt: Date | null;
   responseBalance: string | null;
+  referenceAttempts: number;
+  referenceNextAttemptAt: Date | null;
 }
 
 export const WagerTransactionSchema =
@@ -89,10 +91,25 @@ export const WagerTransactionSchema =
         fieldName: 'response_balance',
         nullable: true,
       },
+      referenceAttempts: {
+        type: 'number',
+        fieldName: 'reference_attempts',
+        default: 0,
+      },
+      referenceNextAttemptAt: {
+        type: 'timestamptz',
+        fieldName: 'reference_next_attempt_at',
+        nullable: true,
+      },
     },
     indexes: [
       { name: 'wager_transactions_wallet_idx', properties: ['walletId'] },
       { name: 'wager_transactions_round_idx', properties: ['roundId'] },
+      {
+        name: 'wager_transactions_pending_reference_due_idx',
+        properties: ['referenceNextAttemptAt', 'createdAt'],
+        where: "status = 'PENDING_REFERENCE'",
+      },
     ],
     uniques: [
       {
@@ -100,14 +117,10 @@ export const WagerTransactionSchema =
         properties: ['providerId', 'externalTransactionId'],
       },
       {
-        name: 'wager_transactions_reference_kind_unique',
-        properties: [
-          'providerId',
-          'referenceExternalTransactionId',
-          'kind',
-        ],
+        name: 'wager_transactions_processed_reversal_unique',
+        properties: ['providerId', 'referenceExternalTransactionId'],
         where:
-          "kind in ('REFUND', 'ROLLBACK') and reference_external_transaction_id is not null",
+          "kind in ('REFUND', 'ROLLBACK') and status = 'PROCESSED' and reference_external_transaction_id is not null",
       },
     ],
     checks: [
@@ -124,6 +137,10 @@ export const WagerTransactionSchema =
         name: 'wager_transactions_status_check',
         expression:
           "status in ('PENDING', 'PENDING_REFERENCE', 'PROCESSED', 'REJECTED', 'FAILED')",
+      },
+      {
+        name: 'wager_transactions_reference_attempts_non_negative',
+        expression: 'reference_attempts >= 0',
       },
       {
         name: 'wager_transactions_failure_code_check',

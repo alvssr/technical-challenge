@@ -6,10 +6,11 @@ import { DatabaseModule } from './infrastructure/database/database.module.js';
 import { ProviderAuthGuard } from './infrastructure/http/provider-auth.guard.js';
 import { HealthController } from './infrastructure/health/health.controller.js';
 import { MessagingModule } from './infrastructure/messaging/messaging.module.js';
+import { PendingReferenceWorker } from './infrastructure/workers/pending-reference.worker.js';
 
 @Module({
   imports: [DatabaseModule, MessagingModule],
   controllers: [WalletController, WageringController, HealthController],
-  providers: [FinancialService, ProviderAuthGuard],
+  providers: [FinancialService, ProviderAuthGuard, PendingReferenceWorker],
 })
 export class AppModule {}

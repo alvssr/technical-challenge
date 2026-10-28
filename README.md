@@ -62,9 +62,9 @@ bun run migration:check
 ```
 
 `bun test` inclui testes unitários, HTTP e de integração do fluxo
-PostgreSQL → Outbox → SQS → Inbox. Suba PostgreSQL/LocalStack e aplique as
-migrations antes de executar a suíte no host. A imagem Compose aplica migrations
-automaticamente ao iniciar.
+PostgreSQL → Outbox → SQS → Inbox, além de cenários de reversão e retry após
+rejeição. Suba PostgreSQL/LocalStack e aplique as migrations antes de executar
+a suíte no host. A imagem Compose aplica migrations automaticamente ao iniciar.
 No momento, `migration:check` ainda detecta as quatro foreign keys
 gerenciadas pelas migrations como divergência, porque os schemas MikroORM
 representam as referências como UUIDs escalares. Não use `schema:update --run`
@@ -139,6 +139,42 @@ Uma aposta sem saldo suficiente é persistida com status `REJECTED` e
 `failureCode: "INSUFFICIENT_FUNDS"`, sem alterar saldo ou gerar lançamento no
 ledger.
 
+Uma transação processada só pode ser revertida uma vez. Isso impede que um
+`REFUND` e um `ROLLBACK` independentes creditem duas vezes o mesmo `BET`.
+Para desfazer um `REFUND`, o `ROLLBACK` referencia o identificador externo do
+próprio refund. Reversões rejeitadas não reservam a referência e podem ser
+tentadas novamente com uma nova operação após a condição que causou a rejeição
+ser resolvida.
+
+### Roteiro de demonstração do MVP
+
+Com PostgreSQL, LocalStack e a aplicação ativos, use o Swagger em
+`http://localhost:3000/docs` ou repita as chamadas `curl` acima. Este roteiro
+usa uma carteira nova com saldo de R$ 100,00; preserve os IDs e a chave de
+idempotência entre chamadas relacionadas:
+
+1. Crie uma carteira e envie um `BET` de R$ 25,00. A operação deve ser
+   `PROCESSED` e o saldo deve ficar em R$ 75,00.
+2. Reenvie o mesmo `BET` com a mesma chave e o mesmo payload. A resposta deve
+   indicar `idempotentReplay: true`, sem novo débito.
+3. Reutilize essa chave com um valor diferente. A API deve responder HTTP 409.
+4. Envie outro `BET` de R$ 100,00. Ele deve ser rejeitado por saldo
+   insuficiente, sem alterar os R$ 75,00.
+5. Envie um `ROLLBACK` de R$ 10,00 referenciando um identificador externo de
+   `BET` que ainda não existe. A resposta inicial deve ser HTTP 202 com
+   `PENDING_REFERENCE`.
+6. Crie o `BET` de R$ 10,00 usando esse identificador externo. O worker deve
+   processar a referência pendente; repita o `ROLLBACK` original com a mesma
+   chave e payload até o status persistido ser `PROCESSED`. O saldo deve voltar
+   a R$ 75,00.
+7. Execute a reconciliação. O resultado deve ser `consistent: true`, com o
+   saldo materializado igual ao saldo calculado pelo ledger.
+
+O worker pode levar alguns segundos para resolver a operação pendente, conforme
+o intervalo de polling e o backoff. O roteiro demonstra a fatia financeira
+síncrona e o processamento posterior de referências; não demonstra o
+consumidor de comandos financeiros SQS, que permanece fora do escopo atual.
+
 ### Reconciliação
 
 ```bash
@@ -181,9 +217,19 @@ O publisher faz tentativas com backoff e sem marcar como publicado antes do
 SQS aceitar a mensagem; após crash na janela de envio/commit, uma mensagem pode
 ser duplicada (entrega at-least-once). O consumidor grava a Inbox na transação
 antes de confirmar a mensagem no SQS, usando `eventId` estável para deduplicar
-reentregas. A fila LocalStack tem DLQ/redrive para cinco tentativas. Ainda falta
-o worker que retoma automaticamente transações `PENDING_REFERENCE` quando a
-referência chegar posteriormente.
+reentregas. A fila LocalStack tem DLQ/redrive para cinco tentativas.
+
+O `PendingReferenceWorker` consulta até dez transações elegíveis por ciclo com
+`SKIP LOCKED` e reprocessa referências que chegam depois, ou que ainda estavam
+em processamento. Ele aplica backoff de 1, 2, 4 e 8 segundos. Na quinta
+tentativa sem uma referência processada, a transação termina como `REJECTED`
+com `MISSING_REFERENCE` e evento de rejeição na Outbox. Estado, saldo, ledger e
+Outbox são confirmados no mesmo commit. O primeiro aceite permanece
+`202 PENDING_REFERENCE`; um replay posterior reflete o estado persistido após
+a resolução.
+
+O consumidor SQS atual trata notificações de integração; o consumidor de
+comandos financeiros descrito no edital ainda precisa ser implementado.
 
 Veja [ARCHITECTURE.md](./ARCHITECTURE.md) para as decisões, riscos e desenho de
 extensão, e [STUDY_GUIDE.md](./STUDY_GUIDE.md) para o roteiro didático.

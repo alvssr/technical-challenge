@@ -10,4 +10,4 @@ RUN bun run build
 
 EXPOSE 3000
 
-CMD ["sh", "-c", "bun run sqs:init && bun run migration:up && bun run start:prod"]
+CMD ["sh", "-c", "bun run sqs:init && MIKRO_ORM_ALLOW_GLOBAL_CLI=1 bun run migration:up && bun run start:prod"]
