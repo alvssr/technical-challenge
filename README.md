@@ -78,6 +78,15 @@ As rotas financeiras exigem `Authorization: Bearer <API_BEARER_TOKEN>`. O token
 Identity Provider nem uma estratégia adequada para separar provedores em
 produção. `/health/live` e `/health/ready` são públicos.
 
+### Swagger / OpenAPI
+
+Com a aplicação no ar, abra `http://localhost:3000/docs` para explorar e testar
+as rotas. Use o botão **Authorize** e informe o token configurado em
+`API_BEARER_TOKEN` (sem escrever o prefixo `Bearer` no campo). Para endpoints
+financeiros, o Swagger incluirá o header de autorização; ao testar apostas,
+preencha também `Idempotency-Key`. O documento OpenAPI em JSON fica disponível
+em `http://localhost:3000/docs/openapi.json`.
+
 ### Criar carteira
 
 ```bash

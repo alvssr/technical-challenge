@@ -8,8 +8,14 @@ import { GetQueueAttributesCommand, SQSClient } from '@aws-sdk/client-sqs';
 import { MikroORM } from '@mikro-orm/postgresql';
 import { DATABASE_ORM } from '../database/database.module.js';
 import { SQS_CLIENT } from '../messaging/sqs-client.js';
+import {
+  ApiOperation,
+  ApiResponse,
+  ApiTags,
+} from '@nestjs/swagger';
 
 @Controller('health')
+@ApiTags('Health')
 export class HealthController {
   constructor(
     @Inject(DATABASE_ORM) private readonly orm: MikroORM,
@@ -17,11 +23,16 @@ export class HealthController {
   ) {}
 
   @Get('live')
+  @ApiOperation({ summary: 'Verifica se o processo HTTP está ativo' })
+  @ApiResponse({ status: 200, description: 'Aplicação ativa.' })
   live(): { status: 'ok' } {
     return { status: 'ok' };
   }
 
   @Get('ready')
+  @ApiOperation({ summary: 'Verifica PostgreSQL e fila SQS' })
+  @ApiResponse({ status: 200, description: 'Dependências disponíveis.' })
+  @ApiResponse({ status: 500, description: 'Uma ou mais dependências indisponíveis.' })
   async ready(): Promise<{ status: 'ready' }> {
     const queueUrl = process.env.SQS_WAGERS_QUEUE_URL;
     if (!queueUrl) {
